@@ -1,0 +1,203 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Creates the rescources required for autoscaling of webservers across two subnets and a 
+             loadbalancer to distribute the requests over the executing webserver instances. 
+             Which are following - an autoscaling group, a launch template for webservers, a webserver security group, 
+             an application load balancer, an loadbalancer security group, a target group, a listener 
+             and listener rules.
+
+Parameters:
+  MyVpc:
+    Description: The virtual private cloud to operate in
+    Type: String
+    Default: "vpc-b39a45ca"
+
+  MySubn1:
+    Description: The 1st subnet
+    Type: String
+    Default: "subnet-c05b119a"
+  MySubn2:
+    Description: The 2nd subnet
+    Type: String
+    Default: "subnet-25f8f143"
+  MySubn3:
+    Description: The 3rd subnet 
+    Type: String
+    Default: "subnet-91051dd9"
+  MySubnets:
+    Description: A list of the valid subnetworks. If using only two, pick the relevant definition and comment out the other one.
+    Type: String
+#    Deafult: !Join [ ",", [ !Ref MySubn1, !Ref MySubn2 ]]
+    Deafult: !Join [ ",", [ !Ref MySubn1, !Ref MySubn2, !Ref MySubn3 ]]
+    
+  DevEnvCIDR:
+    Description: The IP range of the development environments with allowed tcp/ssh access. In CIDR notation.
+    Type: String
+    Default: 172.31.16.22/32
+
+  NameOnPage:
+    Description: The name to place on the web page
+    Type: String
+    Default: "Lill-Ann"
+
+Resources:
+  MyLaunchTemplate:
+    Description: A template for the webserver EC2s that displays a welcome page with a name on - specified by parameter 
+                 'NameOnPage', the date and time of creation and a random number 1-10 (just to help tell them apart).
+    Type: 'AWS::EC2::LaunchTemplate'
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-launch-template-for-auto-scaling'
+      LaunchTemplateData:
+        ImageId: 'ami-0fc970315c2d38f01'
+        InstanceType: t2.micro
+        UserData: 
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash -x
+              yum update -y
+              amazon-linux-extras install nginx1 -y
+              systemctl start nginx
+              systemctl enable nginx
+              sed -i -e "s/Administrator/${NameOnPage} $(date)/"        /usr/share/nginx/html/index.html
+              sed -i -e "s/UTC 2021/--  $(( ( RANDOM % 10 )  + 1 ))/"   /usr/share/nginx/html/index.html
+        KeyName: MyBestKey
+        SecurityGroupIds: 
+#          - !Ref WebSecGrp
+          - !GetAtt DevSecGrp.GroupId
+          - !GetAtt LimHttpSecGrp.GroupId
+        Monitoring: 
+          Enabled: true
+
+  DevSecGrp:
+    Description: A security group for developers access. 
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: "Developers ssh access"
+      GroupName: "DEV-SG"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: !Ref DevEnvCIDR  # from development hosts only
+      VpcId: !Ref MyVpc
+      Tags:
+        - Key: "Name"
+          Value: "SSH access group"
+
+  httpSecGrp:
+    Description: A security group for incoming http access. 
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: "Incoming http access"
+      GroupName: "http-SG"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0   # from anywhere
+      VpcId: !Ref MyVpc
+      Tags:
+        - Key: "Name"
+          Value: "http access group"
+
+  LimHttpSecGrp:
+    Description: A security group to forward http access. 
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: "Limit http access from ALB only"
+      GroupName: "Lim-http-SG"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          SourceSecurityGroupId: !GetAtt httpSecGrp.GroupId
+      VpcId: !Ref MyVpc
+      Tags:
+        - Key: "Name"
+          Value: "Limited http access group"
+
+  MyASG:
+    Description: An ASG that launches the webservers with 'MyLaunchTemplate'and connects to 'MyTargetGroup'
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      AutoScalingGroupName: MyASG
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: "2"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref   MyLaunchTemplate
+        Version: !GetAtt   MyLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: "Name"
+          Value: !Sub Webserver - ${NameOnPage}
+          PropagateAtLaunch: true
+      VPCZoneIdentifier:
+        - !Ref MySubnets
+      TargetGroupARNs:
+        - !Ref MyTargetGroup
+
+  MyTargetGroup:
+    Description: A target group in this VPC for the autoscaled webservers.
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      Port: 80
+      Protocol: "HTTP"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: "HTTP"
+      TargetType: "instance"
+      Matcher: 
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: "load_balancing.algorithm.type"
+          Value: "round_robin"
+      VpcId: !Ref MyVpc
+      Name: "WebsTG"
+
+  MyALB:
+    Description: An Application load balancer 
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties: 
+      Name: "MyALB"
+      Type: "application"
+      Scheme: "internet-facing"
+      Subnets: 
+      - !Ref MySubnets
+      SecurityGroups: 
+        - !Ref httpSecGrp
+#        - !GetAtt httpSecGrp.GroupId
+
+  MyListener:
+    Description: An HTTP listener. Forwrds public requests to the target group instances.
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties: 
+      LoadBalancerArn: !Ref MyALB
+      Port: 80
+      Protocol: "HTTP"
+      DefaultActions:
+      - Order: 1
+        TargetGroupArn: !Ref MyTargetGroup
+        Type: "forward"
+
+Outputs:      
+    ALB:
+        Description: The created Application load balancer
+        Value: !Ref MyALB
+    ASG:
+        Description: The created AutoScalingGroup
+        Value: !Ref MyASG
+    TG:
+        Description: The created TargetGroup
+        Value: !Ref MyTargetGroup
+    SG1:
+        Description: The created SecurityGroup for the webserver developer access
+        Value: !Ref DevSecGrp
+    SG2:
+        Description: The created SecurityGroup for the ALB http access  
+        Value: !Ref httpSecGrp
+    SG3:
+        Description: The created SecurityGroup for the webserver http access
+        Value: !Ref LimHttpSecGrp
+    SN:
+        Description: test
+        Value: !Join [ ",", [ !Ref MySubn1, !Ref MySubn2, !Ref MySubn3 ]]
