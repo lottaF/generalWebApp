@@ -165,7 +165,6 @@ Resources:
       - !Ref MySubnets
       SecurityGroups: 
         - !Ref httpSecGrp
-#        - !GetAtt httpSecGrp.GroupId
 
   MyListener:
     Description: An HTTP listener. Forwrds public requests to the target group instances.
