@@ -8,4 +8,3 @@ Instructions:
     - Subnet identities,
     - Name to put on webpage,
     - Name-id of keyfile to use for webserver generation.
-
